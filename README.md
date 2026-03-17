@@ -2,7 +2,7 @@
 # Dead Drop — CTF Challenge
 
 **Category:** Network Forensics  
-**Difficulty:** Hard  
+**Difficulty:** Medium
 **Flag format:** `securinetsenit{...}`
 
 ## Description
