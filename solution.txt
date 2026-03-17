@@ -1,0 +1,100 @@
+Dead Drop — CTF Challenge Solution
+====================================
+
+FLAG: securinetsenit{d3ad_dr0p_acr0ss_th3_w1r3}
+
+--- Stage 1: DNS Exfiltration ---
+Filter : dns && ip.dst == 8.8.8.8 && dns.qry.name contains "evil-c2.net"
+Action : Extract subdomain labels, base64-decode each, sort by leading digit,
+         strip "N:" prefix, concatenate → URL path: /r3c0n/d4t4
+
+--- Stage 2: HTTP Header Stego ---
+Filter : http && ip.dst == 45.33.32.156 && http.request.uri == "/r3c0n/d4t4"
+Action : In the HTTP *response*, read:
+           X-Debug-Token: 4152  → 0x41 0x52
+           ETag: "4721"         → 0x47 0x21
+         Combined XOR key: b'\x41\x52\x47\x21'  ("ARG!")
+         Body comment hints: look at UDP/9999
+
+--- Stage 3: TCP Reassembly ---
+Filter : tcp.port == 4444
+Action : Sort packets by TCP SEQ number, reassemble payload.
+         Confirms XOR key and says "check ICMP payloads for the password."
+
+--- Stage 4: XOR-encrypted ZIP over UDP ---
+Filter : udp.port == 9999
+Action : Extract each payload, read first 2 bytes as big-endian uint16 (seq),
+         sort by seq, strip 2-byte prefix, concatenate, XOR with b'ARG!',
+         save result as secret.zip.  (Ignore datagrams with seq=0xFFFF.)
+
+--- Stage 5: ICMP PNG polyglot ---
+Filter : icmp.type == 8   (echo REQUESTS only — replies are a decoy)
+Action : Sort by icmp.seq, concatenate payloads (64 bytes each, trim null padding),
+         save as hidden.png.
+         Parse PNG chunks manually or with pngcheck / Python struct.
+         Find the zTXt chunk (keyword="passwd"), zlib-decompress the value:
+           ZIP password = "s3cr3t_p4ss!"
+
+--- Stage 6: Extract the flag ---
+  unzip -P 's3cr3t_p4ss!' secret.zip
+  cat flag.txt
+  → securinetsenit{d3ad_dr0p_acr0ss_th3_w1r3}
+
+--- Solve script (Python) ---
+
+# Stage 4
+from scapy.all import rdpcap
+import struct, zlib
+
+pkts = rdpcap("dead_drop.pcap")
+
+# Stage 4 reassembly
+udp_frags = {}
+for p in pkts:
+    if p.haslayer("UDP") and p["UDP"].sport == 9999 and p.haslayer("Raw"):
+        raw = bytes(p["Raw"])
+        if len(raw) >= 2:
+            seq = struct.unpack(">H", raw[:2])[0]
+            if seq != 0xFFFF:
+                udp_frags[seq] = raw[2:]
+
+encrypted = b"".join(udp_frags[k] for k in sorted(udp_frags))
+key = b"\x41\x52\x47\x21"
+zip_data = bytes([b ^ key[i%4] for i, b in enumerate(encrypted)])
+open("secret.zip", "wb").write(zip_data)
+print("ZIP saved.")
+
+# Stage 5 reassembly
+icmp_frags = {}
+for p in pkts:
+    if p.haslayer("ICMP") and p["ICMP"].type == 8 and p.haslayer("Raw"):
+        icmp_frags[p["ICMP"].seq] = bytes(p["Raw"])
+
+png_data = b"".join(icmp_frags[k] for k in sorted(icmp_frags))
+png_data = png_data.rstrip(b"\x00")  # trim padding on last fragment
+open("hidden.png", "wb").write(png_data)
+
+# Parse PNG chunks to extract zTXt password
+import io
+buf = io.BytesIO(png_data)
+buf.read(8)  # skip PNG signature
+password = None
+while True:
+    length_bytes = buf.read(4)
+    if len(length_bytes) < 4:
+        break
+    length    = struct.unpack(">I", length_bytes)[0]
+    chunk_type = buf.read(4)
+    data       = buf.read(length)
+    buf.read(4)  # CRC
+    if chunk_type == b"zTXt":
+        null_idx = data.index(b"\x00")
+        keyword  = data[:null_idx].decode()
+        comp_val = data[null_idx+2:]  # skip null + compression_method
+        value    = zlib.decompress(comp_val).decode()
+        print(f"zTXt keyword={keyword!r}  value={value!r}")
+        password = value
+        break
+
+print(f"ZIP password: {password}")
+# Now: unzip -P '<password>' secret.zip  or use zipfile with password
